@@ -1,16 +1,30 @@
 # encoding: ascii-8bit
-
 Bitcoin.require_dependency :mongo
+
+include Mongo
 
 module Bitcoin::Storage::Backends
   class MongoStore < StoreBase
 
-    attr_accessor :blk, :tx
+    attr_accessor :db
 
-    def initialize *args
-      reset
-      super(*args)
+    DEFAULT_CONFIG = {
+      db: "mongodb://localhost/bitcoin"
+    }
+    # create sequel store with given +config+
+    def initialize config, *args
+      super config, *args
     end
+
+    def init_store_connection
+      return unless @config[:db]
+      log.info { "connecting to #{@config[:db]}" }
+      client = MongoClient.from_uri(@config[:db])
+      @db = client.db()
+      log.info { @db.to_s }
+    end
+
+    # DUMMY:
 
     def reset
       @blk, @tx = [], {}

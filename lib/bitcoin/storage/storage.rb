@@ -446,7 +446,7 @@ module Bitcoin::Storage
 
       #set the connection
       def init_store_connection
-        return  unless (self.is_a?(SequelStore) || self.is_a?(UtxoStore)) && @config[:db]
+        return  unless @config[:db]
         @config[:db].sub!("~", ENV["HOME"])
         @config[:db].sub!("<network>", Bitcoin.network_name.to_s)
         adapter = SEQUEL_ADAPTERS[@config[:db].split(":").first] rescue nil
