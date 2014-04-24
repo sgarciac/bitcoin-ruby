@@ -6,30 +6,158 @@ include Mongo
 module Bitcoin::Storage::Backends
   class MongoStore < StoreBase
 
-    attr_accessor :db
+    #Collection
+    BLK = "blk"
+    TX = "tx"
+
+    #Block document attributes
+    HASH = "hash"
+    DEPTH = "depth"
+    CHAIN = "chain"
+    VERSION = "version"
+    PREV_HASH = "prev_hash"
+    MRKL_ROOT = "mrkl_root"
+    TIME = "time"
+    BITS = "bits"
+    NONCE = "nonce"
+    BLK_SIZE = "blk_size"
+    WORK = "work"
+    AUX_POW = "aux_pow"
+
+    attr_accessor :db, :client
 
     DEFAULT_CONFIG = {
       db: "mongodb://localhost/bitcoin"
     }
-    # create sequel store with given +config+
+
+    # create mongo store with given +config+
     def initialize config, *args
       super config, *args
     end
 
     def init_store_connection
       return unless @config[:db]
-      log.info { "connecting to #{@config[:db]}" }
-      client = MongoClient.from_uri(@config[:db])
-      @db = client.db()
-      log.info { @db.to_s }
+      log.info { "Connecting to #{@config[:db]}" }
+      @client = MongoClient.from_uri(@config[:db])
+      @db = @client.db
+      log.info { @db.name }
     end
-
-    # DUMMY:
 
     def reset
-      @blk, @tx = [], {}
+      return unless @client && @db
+      @client.drop_database(@db.name)
     end
 
+    #mongo
+    def persist_block blk, chain, depth, prev_work = 0
+      block_document = {
+        HASH => blk.hash.htb.blob,
+        DEPTH => depth,
+        CHAIN => chain,
+        VERSION => blk.ver,
+        PREV_HASH => blk.prev_block.reverse.blob,
+        MRKL_ROOT => blk.mrkl_root.reverse.blob,
+        TIME => blk.time,
+        BITS => blk.bits,
+        NONCE => blk.nonce,
+        BLK_SIZE => blk.to_payload.bytesize,
+        WORK => (prev_work + blk.block_work).to_s
+      }
+      block_document[AUX_POW] = blk.aux_pow.to_payload.blob if blk.aux_pow
+      #update or create
+      update_response = db[BLK].find_and_modify(:query => {HASH => blk.hash.htb.blob}, :update => block_document, :new => true, :upsert => true, :full_response => true)
+      #if its a new block
+      unless update_response["lastErrorObject"]["updateExisting"]
+        # collect the transactions that are already in the db
+        existing_tx = Set.new @db[TX].find(HASH => {"$in" => blk.tx.map {|tx| tx.hash.htb.blob }}).map { |tx| tx[:hash].hth }
+        blk.tx.each.with_index do |tx, idx|
+          if existing_tx.include? tx.hash
+            blk_tx[idx] = existing_tx[tx.hash]
+          else
+            new_tx << [tx, idx]
+          end
+        end
+
+          #new_tx_ids = fast_insert(:tx, new_tx.map {|tx, _| tx_data(tx) }, return_ids: true)
+          #new_tx_ids.each.with_index {|tx_id, idx| blk_tx[new_tx[idx][1]] = tx_id }
+
+          #fast_insert(:blk_tx, blk_tx.map.with_index {|id, idx| { blk_id: block_id, tx_id: id, idx: idx } })
+
+      end
+
+    end
+
+    # sequel:
+    def persist_block blk, chain, depth, prev_work = 0
+      @db.transaction do
+        attrs = {
+          :hash => blk.hash.htb.blob,
+          :depth => depth,
+          :chain => chain,
+          :version => blk.ver,
+          :prev_hash => blk.prev_block.reverse.blob,
+          :mrkl_root => blk.mrkl_root.reverse.blob,
+          :time => blk.time,
+          :bits => blk.bits,
+          :nonce => blk.nonce,
+          :blk_size => blk.to_payload.bytesize,
+          :work => (prev_work + blk.block_work).to_s
+        }
+        attrs[:aux_pow] = blk.aux_pow.to_payload.blob  if blk.aux_pow
+        existing = @db[:blk].filter(:hash => blk.hash.htb.blob)
+        if existing.any?
+          existing.update attrs
+          block_id = existing.first[:id]
+        else
+          block_id = @db[:blk].insert(attrs)
+          blk_tx, new_tx, addrs, names = [], [], [], []
+
+          # store tx
+          existing_tx = Hash[*@db[:tx].filter(hash: blk.tx.map {|tx| tx.hash.htb.blob }).map { |tx| [tx[HASH].hth, tx[:id]] }.flatten]
+          blk.tx.each.with_index do |tx, idx|
+            existing = existing_tx[tx.hash]
+            existing ? blk_tx[idx] = existing : new_tx << [tx, idx]
+          end
+
+          new_tx_ids = fast_insert(:tx, new_tx.map {|tx, _| tx_data(tx) }, return_ids: true)
+          new_tx_ids.each.with_index {|tx_id, idx| blk_tx[new_tx[idx][1]] = tx_id }
+
+          fast_insert(:blk_tx, blk_tx.map.with_index {|id, idx| { blk_id: block_id, tx_id: id, idx: idx } })
+
+          # store txins
+          fast_insert(:txin, new_tx.map.with_index {|tx, tx_idx|
+            tx, _ = *tx
+            tx.in.map.with_index {|txin, txin_idx|
+              txin_data(new_tx_ids[tx_idx], txin, txin_idx) } }.flatten)
+
+          # store txouts
+          txout_i = 0
+          txout_ids = fast_insert(:txout, new_tx.map.with_index {|tx, tx_idx|
+            tx, _ = *tx
+            tx.out.map.with_index {|txout, txout_idx|
+              script_type, a, n = *parse_script(txout, txout_i, tx.hash, txout_idx)
+              addrs += a; names += n; txout_i += 1
+              txout_data(new_tx_ids[tx_idx], txout, txout_idx, script_type) } }.flatten, return_ids: true)
+
+          # store addrs
+          persist_addrs addrs.map {|i, h| [txout_ids[i], h]}
+          names.each {|i, script| store_name(script, txout_ids[i]) }
+        end
+        @head = wrap_block(attrs.merge(id: block_id))  if chain == MAIN
+        @db[:blk].where(:prev_hash => blk.hash.htb.blob, :chain => ORPHAN).each do |b|
+          log.debug { "connecting orphan #{b[:hash].hth}" }
+          begin
+            store_block(get_block(b[:hash].hth))
+          rescue SystemStackError
+            EM.defer { store_block(get_block(b[:hash].hth)) }  if EM.reactor_running?
+          end
+        end
+        return depth, chain
+      end
+    end
+
+
+    #dummy:
     def persist_block(blk, chain, depth, prev_work = 0)
       return [depth, chain]  unless blk && chain == 0
       if block = get_block(blk.hash)
@@ -43,6 +171,10 @@ module Bitcoin::Storage::Backends
       log.info { "NEW HEAD: #{blk.hash} DEPTH: #{get_depth}" }
       [depth, chain]
     end
+
+
+    # DUMMY:
+
 
     def store_tx(tx, validate = true)
       if @tx.keys.include?(tx.hash)
