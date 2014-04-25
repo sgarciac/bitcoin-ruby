@@ -4,14 +4,17 @@ Bitcoin.require_dependency :mongo
 include Mongo
 
 module Bitcoin::Storage::Backends
+
+  # A dummy implementation based on mongodb
   class MongoStore < StoreBase
 
     #Collection
     BLK = "blk"
     TX = "tx"
 
-    #Block document attributes
+    #attributes
     HASH = "hash"
+    TX = "tx"
     DEPTH = "depth"
     CHAIN = "chain"
     VERSION = "version"
@@ -23,6 +26,9 @@ module Bitcoin::Storage::Backends
     BLK_SIZE = "blk_size"
     WORK = "work"
     AUX_POW = "aux_pow"
+    COINBASE = "coinbase"
+    TX_SIZE = "tx_size"
+    BLK_HASH = "blk_hash"
 
     attr_accessor :db, :client
 
@@ -45,7 +51,9 @@ module Bitcoin::Storage::Backends
 
     def reset
       return unless @client && @db
-      @client.drop_database(@db.name)
+      database_name = @db.name
+      @client.drop_database(database_name)
+      @db = @client.db(database_name)
     end
 
     #mongo
@@ -61,132 +69,87 @@ module Bitcoin::Storage::Backends
         BITS => blk.bits,
         NONCE => blk.nonce,
         BLK_SIZE => blk.to_payload.bytesize,
+        TX => blk.tx.map {|tx| tx.hash.htb.blob},
         WORK => (prev_work + blk.block_work).to_s
       }
       block_document[AUX_POW] = blk.aux_pow.to_payload.blob if blk.aux_pow
-      #update or create
-      update_response = db[BLK].find_and_modify(:query => {HASH => blk.hash.htb.blob}, :update => block_document, :new => true, :upsert => true, :full_response => true)
-      #if its a new block
-      unless update_response["lastErrorObject"]["updateExisting"]
-        # collect the transactions that are already in the db
-        existing_tx = Set.new @db[TX].find(HASH => {"$in" => blk.tx.map {|tx| tx.hash.htb.blob }}).map { |tx| tx[:hash].hth }
-        blk.tx.each.with_index do |tx, idx|
-          if existing_tx.include? tx.hash
-            blk_tx[idx] = existing_tx[tx.hash]
-          else
-            new_tx << [tx, idx]
-          end
-        end
-
-          #new_tx_ids = fast_insert(:tx, new_tx.map {|tx, _| tx_data(tx) }, return_ids: true)
-          #new_tx_ids.each.with_index {|tx_id, idx| blk_tx[new_tx[idx][1]] = tx_id }
-
-          #fast_insert(:blk_tx, blk_tx.map.with_index {|id, idx| { blk_id: block_id, tx_id: id, idx: idx } })
-
-      end
-
-    end
-
-    # sequel:
-    def persist_block blk, chain, depth, prev_work = 0
-      @db.transaction do
-        attrs = {
-          :hash => blk.hash.htb.blob,
-          :depth => depth,
-          :chain => chain,
-          :version => blk.ver,
-          :prev_hash => blk.prev_block.reverse.blob,
-          :mrkl_root => blk.mrkl_root.reverse.blob,
-          :time => blk.time,
-          :bits => blk.bits,
-          :nonce => blk.nonce,
-          :blk_size => blk.to_payload.bytesize,
-          :work => (prev_work + blk.block_work).to_s
-        }
-        attrs[:aux_pow] = blk.aux_pow.to_payload.blob  if blk.aux_pow
-        existing = @db[:blk].filter(:hash => blk.hash.htb.blob)
-        if existing.any?
-          existing.update attrs
-          block_id = existing.first[:id]
-        else
-          block_id = @db[:blk].insert(attrs)
-          blk_tx, new_tx, addrs, names = [], [], [], []
-
-          # store tx
-          existing_tx = Hash[*@db[:tx].filter(hash: blk.tx.map {|tx| tx.hash.htb.blob }).map { |tx| [tx[HASH].hth, tx[:id]] }.flatten]
-          blk.tx.each.with_index do |tx, idx|
-            existing = existing_tx[tx.hash]
-            existing ? blk_tx[idx] = existing : new_tx << [tx, idx]
-          end
-
-          new_tx_ids = fast_insert(:tx, new_tx.map {|tx, _| tx_data(tx) }, return_ids: true)
-          new_tx_ids.each.with_index {|tx_id, idx| blk_tx[new_tx[idx][1]] = tx_id }
-
-          fast_insert(:blk_tx, blk_tx.map.with_index {|id, idx| { blk_id: block_id, tx_id: id, idx: idx } })
-
-          # store txins
-          fast_insert(:txin, new_tx.map.with_index {|tx, tx_idx|
-            tx, _ = *tx
-            tx.in.map.with_index {|txin, txin_idx|
-              txin_data(new_tx_ids[tx_idx], txin, txin_idx) } }.flatten)
-
-          # store txouts
-          txout_i = 0
-          txout_ids = fast_insert(:txout, new_tx.map.with_index {|tx, tx_idx|
-            tx, _ = *tx
-            tx.out.map.with_index {|txout, txout_idx|
-              script_type, a, n = *parse_script(txout, txout_i, tx.hash, txout_idx)
-              addrs += a; names += n; txout_i += 1
-              txout_data(new_tx_ids[tx_idx], txout, txout_idx, script_type) } }.flatten, return_ids: true)
-
-          # store addrs
-          persist_addrs addrs.map {|i, h| [txout_ids[i], h]}
-          names.each {|i, script| store_name(script, txout_ids[i]) }
-        end
-        @head = wrap_block(attrs.merge(id: block_id))  if chain == MAIN
-        @db[:blk].where(:prev_hash => blk.hash.htb.blob, :chain => ORPHAN).each do |b|
-          log.debug { "connecting orphan #{b[:hash].hth}" }
-          begin
-            store_block(get_block(b[:hash].hth))
-          rescue SystemStackError
-            EM.defer { store_block(get_block(b[:hash].hth)) }  if EM.reactor_running?
-          end
-        end
-        return depth, chain
-      end
-    end
-
-
-    #dummy:
-    def persist_block(blk, chain, depth, prev_work = 0)
-      return [depth, chain]  unless blk && chain == 0
-      if block = get_block(blk.hash)
-        log.info { "Block already stored; skipping" }
-        return false
-      end
-
+      # create or update
+      db[BLK].update({HASH => blk.hash.htb.blob}, block_document, { :upsert => true })
       blk.tx.each {|tx| store_tx(tx) }
-      @blk << blk
-
       log.info { "NEW HEAD: #{blk.hash} DEPTH: #{get_depth}" }
       [depth, chain]
     end
 
-
-    # DUMMY:
-
-
+    # store transaction +tx+
     def store_tx(tx, validate = true)
-      if @tx.keys.include?(tx.hash)
-        log.info { "Tx already stored; skipping" }
-        return tx
-      end
-      @tx[tx.hash] = tx
+      @log.debug { "Storing tx #{tx.hash} (#{tx.to_payload.bytesize} bytes)" }
+      tx.validator(self).validate(raise_errors: true)  if validate
+      transaction = @db[TX].find_one(HASH => tx.hash.htb.blob)
+      return transaction[:id]  if transaction
+      @db[TX].update({HASH => tx.hash.htb.blob},tx_data(tx), {:upsert => true})
+      tx.in.each_with_index {|i, idx| store_txin(tx_id, i, idx)}
+      tx.out.each_with_index {|o, idx| store_txout(tx_id, o, idx, tx.hash)}
+      tx.hash.htb.blob
+    end
+
+    # prepare tx data for storage in mongo
+    def tx_data tx
+      data = {
+        HASH => tx.hash.htb.blob,
+        VERSION => tx.ver, lock_time: tx.lock_time,
+        COINBASE => tx.in.size == 1 && tx.in[0].coinbase?,
+        TX_SIZE => tx.payload.bytesize,
+      }
+      data[:nhash] = tx.nhash.htb.blob  if @config[:index_nhash]
+      data
+    end
+
+    # wrap given +block+ into Models::Block
+    def wrap_block(block)
+      return nil  unless block
+      data = {:id => block[HASH], :depth => block[DEPTH], :chain => block[CHAIN], :work => block[WORK].to_i, :hash => block[HASH].hth, :size => block[BLK_SIZE]}
+      blk = Bitcoin::Storage::Models::Block.new(self, data)
+      blk.ver = block[VERSION]
+      blk.prev_block = block[PREV_HASH].reverse
+      blk.mrkl_root = block[MRKL_ROOT].reverse
+      blk.time = block[TIME].to_i
+      blk.bits = block[BITS]
+      blk.nonce = block[NONCE]
+
+      blk.aux_pow = Bitcoin::P::AuxPow.new(block[AUX_POW])  if block[AUX_POW]
+
+      #here: recover transactions from db
+
+      blk_tx = db[:blk_tx].filter(blk_id: block[:id]).join(:tx, id: :tx_id).order(:idx)
+
+      # fetch inputs and outputs for all transactions in the block to avoid additional queries for each transaction
+      inputs = db[:txin].filter(:tx_id => blk_tx.map{ |tx| tx[:id] }).order(:tx_idx).map.group_by{ |txin| txin[:tx_id] }
+      outputs = db[:txout].filter(:tx_id => blk_tx.map{ |tx| tx[:id] }).order(:tx_idx).map.group_by{ |txout| txout[:tx_id] }
+
+      blk.tx = blk_tx.map { |tx| wrap_tx(tx, block[:id], inputs: inputs[tx[:id]], outputs: outputs[tx[:id]]) }
+
+      blk.hash = block[:hash].hth
+      blk
+    end
+
+
+
+    def get_block(blk_hash)
+      wrap_block(@blk.find_one(HASH => blk_hash))
     end
 
     def has_block(blk_hash)
       !!get_block(blk_hash)
     end
+
+
+    # sequel:
+
+
+    # DUMMY:
+
+
+
 
     def has_tx(tx_hash)
       !!get_tx(tx_hash)
@@ -208,9 +171,6 @@ module Bitcoin::Storage::Backends
       wrap_block(@blk.find {|blk| blk.prev_block == [hash].pack("H*").reverse})
     end
 
-    def get_block(blk_hash)
-      wrap_block(@blk.find {|blk| blk.hash == blk_hash})
-    end
 
     def get_block_by_id(blk_id)
       wrap_block(@blk[blk_id])
@@ -263,20 +223,6 @@ module Bitcoin::Storage::Backends
       }.compact
     end
 
-    def wrap_block(block)
-      return nil  unless block
-      data = { id: @blk.index(block), depth: @blk.index(block),
-        work: @blk.index(block), chain: MAIN, size: block.size }
-      blk = Bitcoin::Storage::Models::Block.new(self, data)
-      [:ver, :prev_block, :mrkl_root, :time, :bits, :nonce].each do |attr|
-        blk.send("#{attr}=", block.send(attr))
-      end
-      block.tx.each do |tx|
-        blk.tx << get_tx(tx.hash)
-      end
-      blk.recalc_block_hash
-      blk
-    end
 
     def wrap_tx(transaction)
       return nil  unless transaction
