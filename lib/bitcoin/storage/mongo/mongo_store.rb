@@ -64,11 +64,11 @@ module Bitcoin::Storage::Backends
       @client = MongoClient.from_uri(@config[:db])
       @db = @client.db
       log.info { "Ensuring index."}
-      @db[BLK].ensure_index({HASH => Mongo::ASCENDING})
-      @db[TX].ensure_index({HASH => Mongo::ASCENDING})
-      @db[BLK_TX].ensure_index({BLK_HASH => Mongo::ASCENDING, TX_HASH => Mongo::ASCENDING, IDX => Mongo::ASCENDING})
-      @db[TX_IN].ensure_index({TX_HASH => Mongo::ASCENDING, IDX => Mongo::ASCENDING})
-      @db[TX_OUT].ensure_index({TX_HASH => Mongo::ASCENDING, IDX => Mongo::ASCENDING})
+      @db[BLK].ensure_index({HASH => Mongo::ASCENDING},{:unique => true})
+      @db[TX].ensure_index({HASH => Mongo::ASCENDING},{:unique => true})
+      @db[BLK_TX].ensure_index({BLK_HASH => Mongo::ASCENDING, TX_HASH => Mongo::ASCENDING})
+      @db[TX_IN].ensure_index({TX_HASH => Mongo::ASCENDING})
+      @db[TX_OUT].ensure_index({TX_HASH => Mongo::ASCENDING})
       log.info { "Ready."}
     end
 
