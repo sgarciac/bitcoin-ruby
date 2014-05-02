@@ -66,7 +66,7 @@ module Bitcoin::Storage::Backends
       log.info { "Ensuring index."}
       @db[BLK].ensure_index({HASH => Mongo::ASCENDING})
       @db[TX].ensure_index({HASH => Mongo::ASCENDING})
-      @db[BLK_TX].ensure_index({BLK_HASH => Mongo::ASCENDING, TX_HASH => Mongo::ASCENDING})
+      @db[BLK_TX].ensure_index({BLK_HASH => Mongo::ASCENDING, TX_HASH => Mongo::ASCENDING, IDX => Mongo::ASCENDING})
       @db[TX_IN].ensure_index({TX_HASH => Mongo::ASCENDING, IDX => Mongo::ASCENDING})
       @db[TX_OUT].ensure_index({TX_HASH => Mongo::ASCENDING, IDX => Mongo::ASCENDING})
       log.info { "Ready."}
